@@ -292,12 +292,22 @@ def update_financials_all(codes, conn, sleep=0.3, retries=2):
 # traffic; the WAF is bypassed with a session warm-up that yields a valid
 # cookie). Scraping lives in a separate script; here we just load the result.
 def load_disclosure(csv_path, conn):
-    """Load scraped disclosure dates (code, report_date, publish_date) into DB."""
+    """Load scraped disclosure dates into DB (idempotent UPSERT)."""
     df = pd.read_csv(csv_path)
     df['code'] = df['code'].astype(str).str.zfill(6)
     df = df.drop_duplicates(subset=['code', 'report_date'])
-    df.to_sql('disclosure', conn, if_exists='append', index=False)
+    df = df[['code', 'report_date', 'publish_date']]
+
+    sql = """
+    INSERT INTO disclosure (code, report_date, publish_date)
+    VALUES (?, ?, ?)
+    ON CONFLICT(code, report_date) DO UPDATE SET
+        publish_date = excluded.publish_date
+    """
+    conn.executemany(sql, df.values.tolist())
+    conn.commit()
     return len(df)
+
 
 
 # ============================================================
