@@ -236,12 +236,52 @@ def fetch_financials(code):
     fin['code'] = code
     return fin[['code', 'report_date', 'roe', 'net_margin', 'debt_ratio', 'revenue_growth']]
 
+def update_financials_all(codes, conn, sleep=0.3, retries=2):
+    """Fetch and UPSERT fundamentals for many stocks.
 
-def load_financials(df, conn):
-    """Load a fundamentals DataFrame into the financials table (dedup on PK)."""
-    df = df.drop_duplicates(subset=['code', 'report_date'])
-    df.to_sql('financials', conn, if_exists='append', index=False)
-    return len(df)
+    Mirrors update_price_all: per-stock retry, error isolation, progress, and a
+    final summary. Uses UPSERT so re-running is idempotent (updates existing rows,
+    inserts new ones, never duplicates).
+    """
+    fin_cols = ['code', 'report_date', 'roe', 'net_margin', 'debt_ratio', 'revenue_growth']
+    stats = {'ok': 0, 'failed': 0}
+    failed = []
+
+    # Build the UPSERT statement once
+    update_set = ', '.join([f"{c}=excluded.{c}"
+                            for c in fin_cols if c not in ('code', 'report_date')])
+    sql = f"""
+    INSERT INTO financials ({', '.join(fin_cols)})
+    VALUES ({', '.join(['?'] * len(fin_cols))})
+    ON CONFLICT(code, report_date) DO UPDATE SET
+        {update_set}
+    """
+
+    for i, code in enumerate(codes, 1):
+        code = str(code).zfill(6)
+        ok = False
+        for attempt in range(retries):
+            try:
+                fin = fetch_financials(code)
+                fin = fin.drop_duplicates(subset=['code', 'report_date'])[fin_cols]
+                conn.executemany(sql, fin.values.tolist())
+                conn.commit()
+                stats['ok'] += 1
+                ok = True
+                break
+            except Exception as e:
+                print(f"  {code} attempt {attempt+1} failed: {type(e).__name__}")
+                time.sleep(2)
+        if not ok:
+            stats['failed'] += 1
+            failed.append(code)
+        print(f"progress {i}/{len(codes)}")
+        time.sleep(sleep)
+
+    print(f"\nok: {stats['ok']} | failed: {stats['failed']}")
+    if failed:
+        print("failed:", failed)
+    return stats, failed
 
 
 # ============================================================
@@ -334,21 +374,37 @@ def summary(conn):
 
 
 # ============================================================
-# Example usage
+# Example usage / full pipeline
 # ============================================================
 if __name__ == "__main__":
     conn = sqlite3.connect(DB_PATH)
 
-    # --- Initialize schema and indexes (first run) ---
+    # --- Step 1: initialize schema and indexes (first run only) ---
     create_tables(conn)
     create_indexes(conn)
 
-    # --- Overview ---
+    # --- Step 2: the CSI 300 stock universe ---
+    # On the very first run, seed the universe however you like (e.g. from an
+    # index-constituent list). Afterwards it is simply whatever is in the DB.
+    codes = pd.read_sql("SELECT DISTINCT code FROM daily_price;", conn)['code'].tolist()
+
+    # --- Step 3: load / update the three data sources ---
+    # Prices: incremental UPSERT (only fetches dates newer than the DB).
+    update_price_all(codes, conn)
+
+    # Fundamentals: fetch + UPSERT for all stocks.
+    update_financials_all(codes, conn)
+
+    # Disclosure dates: load the pre-scraped file (scraping lives in
+    # fetch_disclosure.py, which handles the cninfo.com.cn WAF).
+    load_disclosure("disclosure.csv", conn)
+
+    # --- Step 4: inspect ---
     print("Warehouse summary:")
     for name, df in summary(conn).items():
         print(f"  {name}: {df.to_dict('records')}")
 
-    # --- Point-in-time panel for one stock (example) ---
+    # --- Step 5: point-in-time panel (example: one stock) ---
     panel = point_in_time_panel(conn, code='000001',
                                 start='2025-04-10', end='2025-06-30')
     print("\nPoint-in-time panel (000001):")
